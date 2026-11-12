@@ -1,0 +1,540 @@
+#!/bin/zsh
+# tx — tmux workspace persistence across reboots.
+#
+#   tx                 attach; or restore the saved workspace; or start fresh
+#   tx save [--full]   save now (--full also asks every nvim to write its session)
+#   tx status          show what would be restored (dry run)
+#   tx restore [--pick] [file]   restore (optionally pick an older snapshot)
+#   tx down            save, check for unsaved work, then quit tmux
+#   tx ignore          toggle: restore this pane as a plain shell
+#   tx reset           archive the saved workspace (start saving the current server)
+#
+# State: ${TX_STATE:-~/.local/state/tx}. Internal: _loop _confirm _nudge _claude-hook
+
+emulate -R zsh
+setopt extended_glob pipe_fail no_nomatch
+zmodload zsh/stat zsh/datetime
+
+S=${TX_STATE:-$HOME/.local/state/tx}
+CUR=$S/current.json
+INTERVAL=${TX_INTERVAL:-30}
+DEMOTE_AGE=25          # a claude/nvim pane must look "gone" this long before we believe it
+HOLD=5                 # seconds a snapshot that removes panes waits before commit
+TX=${0:A}
+mkdir -p $S/history $S/nvim $S/demote
+
+t() {
+  local o=()
+  [[ -n ${TX_SOCK:-} ]] && o+=(-S $TX_SOCK)
+  [[ -z ${TX_SOCK:-} && -n ${TX_L:-} ]] && o+=(-L $TX_L)
+  [[ -n ${TX_CONF:-} ]] && o+=(-f $TX_CONF)
+  command tmux $o "$@"
+}
+opt()   { t show -gqv "$1" 2>/dev/null }
+spid()  { t list-sessions -F '#{pid}' 2>/dev/null | head -1 }
+alarm() { perl -e 'alarm shift; exec @ARGV' "$@" }    # macOS has no timeout(1)
+log() {
+  [[ -f $S/log ]] && (( $(zstat +size $S/log) > 500000 )) && mv -f $S/log $S/log.1
+  print -r -- "$(strftime '%F %T' $EPOCHSECONDS) [$$] $*" >> $S/log
+}
+die() { print -u2 -r -- "tx: $*"; exit 1 }
+
+US=$'\x1f'
+TS='^~^'     # tmux escapes control chars in -F output, so use a printable separator there
+F="#{session_name}${TS}#{session_last_attached}${TS}#{window_index}${TS}#{window_name}${TS}#{automatic-rename}${TS}#{window_layout}${TS}#{window_zoomed_flag}${TS}#{window_active}${TS}#{window_width}${TS}#{window_height}${TS}#{pane_index}${TS}#{pane_active}${TS}#{pane_current_path}${TS}#{@revive_id}${TS}#{pane_id}${TS}#{pane_tty}${TS}#{pane_pid}${TS}#{pane_dead}${TS}#{@claude_sid}${TS}#{@claude_pid}${TS}#{@claude_cwd}${TS}#{@nvim_sock}${TS}#{@tx_ignore}"
+
+# ───────────────────────────── capture ─────────────────────────────
+
+claude_flags() {   # keep only flags that are safe & meaningful to replay
+  local w=(${(z)1}) out=() i=2
+  while (( i <= $#w )); do
+    case $w[i] in
+      --model|--permission-mode|--effort|--agent|--add-dir|--fallback-model) out+=($w[i] $w[i+1]); (( i+=2 ));;
+      --model=*|--permission-mode=*|--effort=*|--agent=*|--add-dir=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions|--chrome|--no-chrome|--ide|--verbose) out+=$w[i]; (( i++ ));;
+      *) (( i++ ));;
+    esac
+  done
+  print -r -- "${out[*]}"
+}
+
+nvim_pull() {      # $1 socket $2 session file  → ask that nvim to write its session
+  local f=${2//\'/\'\'}
+  local expr="luaeval(\"(function(p) vim.g.tx_session_file=p; if _G.TxSave then return _G.TxSave(p) end; local so=vim.o.sessionoptions; vim.o.sessionoptions='buffers,curdir,folds,help,tabpages,winsize'; local ok=pcall(vim.cmd,'mksession! '..vim.fn.fnameescape(p)); vim.o.sessionoptions=so; return ok and 1 or 0 end)(_A)\", '$f')"
+  alarm 3 nvim --server "$1" --remote-expr "$expr" >/dev/null 2>&1
+}
+
+nvim_sock_for() {  # $@ candidate pids → first live socket
+  local p s
+  for p in "$@"; do
+    for s in ${TMPDIR%/}/nvim.$USER/*/nvim.$p.0(N=) /tmp/nvim.$USER/*/nvim.$p.0(N=); do
+      print -r -- $s; return 0
+    done
+  done
+  return 1
+}
+
+# build <out> <full>  →  0 ok · 1 tmux error · 2 teardown in progress (don't save)
+build() {
+  local out=$1 full=$2 rows
+  rows=$(t list-panes -a -F "$F" 2>/dev/null) || return 1
+  [[ -n $rows ]] || return 2
+  local server=$(spid)
+
+  typeset -A P_PPID P_PGID P_TPGID P_STAT P_ARGS KIDS
+  local pid ppid pgid tpgid stat tty args
+  while read -r pid ppid pgid tpgid stat tty args; do
+    P_PPID[$pid]=$ppid P_PGID[$pid]=$pgid P_TPGID[$pid]=$tpgid P_STAT[$pid]=$stat P_ARGS[$pid]=$args
+    KIDS[$ppid]+="$pid "
+  done < <(ps -A -o pid=,ppid=,pgid=,tpgid=,stat=,tty=,args=)
+
+  local recs=() line
+  for line in ${(f)rows}; do
+    local f=("${(@ps:$TS:)line}")
+    local sess=$f[1] slast=$f[2] wi=$f[3] wn=$f[4] wauto=$f[5] lay=$f[6] wz=$f[7] wa=$f[8] ww=$f[9] wh=$f[10]
+    local pi=$f[11] pa=$f[12] cwd=$f[13] rid=$f[14] pane=$f[15] shpid=$f[17] dead=$f[18]
+    local csid=$f[19] cpid=$f[20] ccwd=$f[21] nsock=$f[22] ign=$f[23]
+    [[ $sess == __tx_boot ]] && continue
+    [[ $dead == 1 ]] && return 2
+    [[ -z ${P_PGID[$shpid]:-} ]] && return 2          # shell already gone → teardown
+    if [[ -z $rid ]]; then
+      rid=$(uuidgen | tr A-Z a-z); t set -p -t $pane @revive_id $rid
+    fi
+
+    local kind=shell sid= kc= kf= cmd= nfile=
+    local tp=${P_TPGID[$shpid]} fgp=() p=
+    if [[ $ign == 1 ]]; then
+      kind=ignored
+    elif [[ -n $tp && $tp != 0 && $tp != ${P_PGID[$shpid]} ]]; then
+      for p in ${(k)P_PGID}; do [[ ${P_PGID[$p]} == $tp ]] && fgp+=$p; done
+      for p in $fgp; do [[ ${P_STAT[$p]} == *[EZ]* ]] && return 2; done
+      local cp= np=() vp=
+      for p in $fgp; do
+        [[ $p == $cpid || -e $HOME/.claude/sessions/$p.json ]] && { cp=$p; break }
+      done
+      if [[ -z $cp ]]; then
+        for p in $fgp; do
+          case ${${(z)P_ARGS[$p]}[1]:t} in
+            claude) cp=$p;; nvim) np+=$p;; vim|vi|view) vp=$p;;
+          esac
+        done
+      fi
+      if [[ -n $cp ]]; then
+        kind=claude
+        if [[ $cp == $cpid && -n $csid ]]; then
+          sid=$csid kc=${ccwd:-$cwd}
+        elif [[ -e $HOME/.claude/sessions/$cp.json ]]; then
+          sid=$(jq -r '.sessionId // empty' $HOME/.claude/sessions/$cp.json 2>/dev/null)
+          kc=$(jq -r '.cwd // empty' $HOME/.claude/sessions/$cp.json 2>/dev/null)
+        fi
+        kc=${kc:-$cwd}
+        kf=$(claude_flags "${P_ARGS[$cp]}")
+        [[ -z $sid ]] && { kind=other; cmd=claude }
+      elif (( $#np )); then
+        local nargs=${P_ARGS[$np[1]]}
+        if [[ $nargs == *.git/* ]]; then
+          kind=shell                                     # nvim as git's editor: not worth restoring
+        else
+          kind=nvim; cmd=$nargs; nfile=$S/nvim/$rid.vim
+          local sock=
+          [[ -n $nsock && -S $nsock ]] && sock=$nsock
+          [[ -z $sock ]] && sock=$(nvim_sock_for $np ${=KIDS[$np[1]]})
+          if [[ -n $sock ]]; then
+            local age=999999
+            [[ -f $nfile ]] && age=$(( EPOCHSECONDS - $(zstat +mtime $nfile) ))
+            if (( full || age > 90 )); then nvim_pull $sock $nfile || log "nvim pull failed ($sock)"; fi
+          fi
+          [[ -f $nfile ]] || nfile=
+        fi
+      elif [[ -n $vp ]]; then
+        kind=vim; cmd=${P_ARGS[$vp]}
+      else
+        kind=other; cmd=${P_ARGS[$tp]:-${P_ARGS[$fgp[1]]}}
+      fi
+    fi
+    recs+="$sess$US$slast$US$wi$US$wn$US$wauto$US$lay$US$wz$US$wa$US$ww$US$wh$US$pi$US$pa$US$cwd$US$rid$US$kind$US$sid$US$kc$US$kf$US$cmd$US$nfile"
+  done
+
+  print -rl -- $recs | jq -R -s --arg now $EPOCHSECONDS --arg server "$server" '
+    { saved_at: ($now|tonumber), server_pid: $server,
+      panes: (split("\n") | map(select(length>0) | split("\u001f") | {
+        session:.[0], s_last:(.[1]|tonumber? // 0), w_index:(.[2]|tonumber), w_name:.[3], w_auto:.[4],
+        w_layout:.[5], w_zoomed:.[6], w_active:.[7], w_w:.[8], w_h:.[9], p_index:(.[10]|tonumber),
+        p_active:.[11], p_cwd:.[12], rid:.[13], kind:.[14], sid:.[15], ccwd:.[16], cflags:.[17],
+        cmd:.[18], nfile:.[19] })) }' > $out || return 1
+  return 0
+}
+
+panes_hash() { jq -cS '[.panes[] | del(.s_last)]' $1 | shasum | cut -c1-40 }
+
+commit() {   # $1 = new snapshot file
+  local h=$(panes_hash $1)
+  if [[ -f $S/current.hash && $(<$S/current.hash) == $h && -f $CUR ]]; then
+    rm -f $1; return 0
+  fi
+  mv -f $1 $CUR && print -r -- $h > $S/current.hash
+  cp $CUR $S/history/$(strftime '%Y%m%dT%H%M%S' $EPOCHSECONDS).json
+  local old=($S/history/*.json(Nom[21,-1])); (( $#old )) && rm -f $old
+  log "saved $(jq '.panes|length' $CUR) panes"
+}
+
+save_once() {   # $1 full  $2 confirmed
+  local full=$1 confirmed=$2 tmp=$S/.new.$$ rc
+  build $tmp $full; rc=$?
+  if (( rc == 2 )); then log "skip: panes exiting (teardown?)"; rm -f $tmp; return 0; fi
+  (( rc )) && { rm -f $tmp; return 1 }
+  (( $(jq '.panes|length' $tmp) )) || { rm -f $tmp; return 0 }
+
+  if [[ -f $CUR ]]; then
+    local d removed=() demoted=() carry=() m
+    for d in ${(f)"$(jq -r --slurpfile prev $CUR '
+        ($prev[0].panes | map({key:.rid, value:.kind}) | from_entries) as $pk
+      | (.panes | map({key:.rid, value:.kind}) | from_entries) as $nk
+      | ($pk | to_entries[] | select($nk[.key] == null) | "R \(.key)"),
+        ($pk | to_entries[] | select(.value=="claude" or .value=="nvim" or .value=="vim")
+             | select($nk[.key] != null and $nk[.key] != .value) | "D \(.key)")' $tmp)"}; do
+      case $d in R\ *) removed+=${d#R };; D\ *) demoted+=${d#D };; esac
+    done
+    # claude/nvim → shell must be seen for DEMOTE_AGE seconds before we believe it
+    # (unless the user asked for this save: confirmed=2 → tmux is healthy, trust what we see)
+    for d in $demoted; do
+      m=$S/demote/$d
+      if (( confirmed == 2 )); then rm -f $m
+      elif [[ -f $m ]] && (( EPOCHSECONDS - $(zstat +mtime $m) >= DEMOTE_AGE )); then rm -f $m
+      else [[ -f $m ]] || : > $m; carry+=$d; fi
+    done
+    for m in $S/demote/*(N); do (( ${demoted[(Ie)${m:t}]} )) || rm -f $m; done
+    if (( $#carry )); then
+      jq --slurpfile prev $CUR '.panes |= map(. as $p
+          | ($prev[0].panes | map(select(.rid == $p.rid)) | .[0]) as $o
+          | if ($ARGS.positional | index($p.rid)) and $o
+            then $p + ($o | {kind,sid,ccwd,cflags,cmd,nfile}) else $p end)' $tmp --args $carry > $tmp.c \
+        && mv -f $tmp.c $tmp
+    fi
+    # panes disappeared: wait HOLD seconds, then re-check that the server is alive and still agrees
+    if (( $#removed && ! confirmed )); then
+      rm -f $tmp
+      if [[ ! -f $S/pending ]] || (( EPOCHSECONDS - $(zstat +mtime $S/pending) > 30 )); then
+        spid > $S/pending
+        ( sleep $HOLD; $TX _confirm ) >/dev/null 2>&1 &!
+      fi
+      return 0
+    fi
+  fi
+  commit $tmp
+}
+
+cmd_save() {
+  local full=0 confirmed=0 debounce=0 a
+  # --now: user-initiated save (prefix S/Q, `tx save` in a terminal) → accept closes immediately
+  for a; do case $a in --full) full=1;; --confirmed) confirmed=1;; --now) confirmed=2;; --debounce) debounce=1;; esac; done
+  [[ -n $(spid) ]] || return 1
+  [[ $(opt @tx_restoring) == 1 || $(opt @tx_frozen) == 1 ]] && return 0
+  if [[ $(opt @tx_active) != 1 ]]; then
+    if [[ -f $CUR ]]; then t set -g @tx_paused 1; return 0; fi
+    t set -g @tx_active 1 \; set -gu @tx_paused \; set -g @tx_state $S
+  fi
+  (( debounce )) && sleep 0.5
+  # lock (stale after 60s); a --now save waits for a running save instead of deferring to it
+  if (( confirmed == 2 )); then
+    local w; for w in {1..50}; do mkdir $S/lock 2>/dev/null && break; sleep 0.2; done
+    [[ -d $S/lock ]] || mkdir $S/lock 2>/dev/null
+  fi
+  if (( confirmed != 2 )) && ! mkdir $S/lock 2>/dev/null; then
+    if (( EPOCHSECONDS - $(zstat +mtime $S/lock 2>/dev/null || print 0) > 60 )); then rm -rf $S/lock; mkdir $S/lock 2>/dev/null || return 0
+    else : > $S/dirty; return 0; fi
+  fi
+  local rc=0
+  {
+    save_once $full $confirmed; rc=$?
+    if [[ -f $S/dirty ]]; then rm -f $S/dirty; save_once 0 0; fi
+  } always { rm -rf $S/lock }
+  return $rc
+}
+
+# ───────────────────────────── restore ─────────────────────────────
+
+DENY='(rm|rmdir|sudo|su|dd|mkfs*|shutdown|reboot|halt|kill|killall|pkill|launchctl|diskutil|chmod|chown|mv|truncate|git push*|git reset*|git clean*|git checkout*|git rebase*|git merge*|brew uninstall*|npm publish*|docker rm*|kubectl delete*|terraform*)'
+
+session_live_elsewhere() {   # is this claude session already open in another process?
+  local f
+  for f in $HOME/.claude/sessions/*.json(N); do
+    [[ $(jq -r '.sessionId // empty' $f 2>/dev/null) == $1 ]] && kill -0 ${${f:t}%.json} 2>/dev/null && return 0
+  done
+  return 1
+}
+
+typeline() { t send-keys -t $1 -l -- " $2"; (( $3 )) && t send-keys -t $1 Enter }
+
+pick_snapshot() {
+  local files=($S/history/*.json(Nom)) i=1 f
+  (( $#files )) || die "no snapshots in $S/history"
+  for f in $files; do
+    printf '%3d) %s  %s\n' $i "$(strftime '%F %T' $(jq .saved_at $f))" \
+      "$(jq -r '[.panes|group_by(.session)|length, length, (map(select(.kind=="claude"))|length), (map(select(.kind=="nvim"))|length)] | "\(.[0]) sessions, \(.[1]) panes, \(.[2]) claude, \(.[3]) nvim"' $f)"
+    (( i++ )); (( i > 20 )) && break
+  done
+  local n; read "n?restore which? [1] " </dev/tty; n=${n:-1}
+  [[ $n == <-> && -n ${files[n]:-} ]] || die "invalid choice"
+  print -r -- $files[n]
+}
+
+cmd_status() {
+  local file=${1:-$CUR}
+  if [[ -n $(spid) ]]; then
+    print "server: running · saving $([[ $(opt @tx_active) == 1 ]] && print active || print 'PAUSED (saved workspace not restored — run: tx restore, or tx reset)')"
+  else
+    print "server: not running"
+  fi
+  [[ -f $file ]] || { print "no saved workspace"; return 0 }
+  print "snapshot: $file · saved $(( EPOCHSECONDS - $(jq .saved_at $file) ))s ago\n"
+  jq -r '.panes | sort_by(.session, .w_index, .p_index)[] |
+    [ "\(.session):\(.w_index).\(.p_index)", .w_name, .kind,
+      (if .kind=="claude" then "claude --resume \(.sid)  (\(.ccwd))"
+       elif .kind=="nvim" then (if .nfile != "" then "nvim -S <session>" else "nvim (no session file)" end) + "  (\(.p_cwd))"
+       elif .kind=="vim" or .kind=="other" then "\(.cmd)  (\(.p_cwd))"
+       else .p_cwd end) ] | @tsv' $file | column -t -s $'\t'
+}
+
+cmd_restore() {
+  local file=$CUR attach=0 a
+  for a; do
+    case $a in
+      --pick) file=$(pick_snapshot) || exit 1;;
+      --attach) attach=1;;
+      -n|--dry-run) cmd_status $file; return;;
+      *) [[ -f $a ]] && file=$a;;
+    esac
+  done
+  [[ -f $file ]] || die "nothing to restore"
+
+  if [[ -n $(spid) ]]; then t set -g @tx_restoring 1
+  else t new-session -d -s __tx_boot \; set -g @tx_restoring 1 \; set -g @tx_state $S || die "cannot start tmux"
+  fi
+  t set -g @tx_state $S
+
+  local rows=(${(f)"$(jq -r '.panes | sort_by(.session, .w_index, .p_index)[] |
+      [.session, .s_last, .w_index, .w_name, .w_auto, .w_layout, .w_zoomed, .w_active, .w_w, .w_h,
+       .p_index, .p_active, .p_cwd, .rid, .kind, .sid, .ccwd, .cflags, .cmd, .nfile] | map(tostring) | join("\u001f")' $file)"})
+
+  typeset -A SNAME            # saved session name → actual name
+  local cur_s= cur_w= wid= lastpane= best_s= best_last=-1
+  local win_ids=() win_layouts=() win_active_pane=() win_zoom=() sess_active_win=()
+  local launch=() fails=() line
+  typeset -i nsess=0 nwin=0 npane=0 nclaude=0 nnvim=0
+
+  for line in $rows; do
+    local f=("${(@ps:$US:)line}")
+    local sess=$f[1] slast=$f[2] wi=$f[3] wn=$f[4] wauto=$f[5] lay=$f[6] wz=$f[7] wa=$f[8] ww=$f[9] wh=$f[10]
+    local pa=$f[12] cwd=$f[13] rid=$f[14] kind=$f[15] sid=$f[16] kc=$f[17] kf=$f[18] cmd=$f[19] nfile=$f[20]
+    [[ -d $cwd ]] || cwd=$HOME
+    local pane= out=
+
+    if [[ $sess != $cur_s ]]; then
+      cur_s=$sess cur_w=
+      local name=$sess n=1
+      while t has-session -t "=$name" 2>/dev/null; do name="$sess-$((n++))"; done
+      SNAME[$sess]=$name
+      out=$(t new-session -d -P -F '#{window_id} #{pane_id} #{window_index}' -s $name -n $wn -c $cwd -x ${ww:-200} -y ${wh:-50}) || { fails+="session $sess: could not create"; continue }
+      wid=${out%% *}; pane=${${out#* }% *}
+      [[ ${out##* } != $wi ]] && t move-window -s $wid -t "=$name:$wi" 2>/dev/null
+      cur_w=$wi; nsess+=1; nwin+=1
+      win_ids+=$wid win_layouts+=$lay win_zoom+=$wz win_active_pane+=$pane
+      (( slast > best_last )) && { best_last=$slast; best_s=$name }
+    elif [[ $wi != $cur_w ]]; then
+      cur_w=$wi
+      out=$(t new-window -d -P -F '#{window_id} #{pane_id}' -t "=${SNAME[$sess]}:$wi" -n $wn -c $cwd) || { fails+="window $sess:$wi: could not create"; continue }
+      wid=${out%% *}; pane=${out#* }; nwin+=1
+      win_ids+=$wid win_layouts+=$lay win_zoom+=$wz win_active_pane+=$pane
+    else
+      pane=$(t split-window -d -P -F '#{pane_id}' -t $lastpane -c $cwd) || { fails+="pane in $sess:$wi: no space"; continue }
+      t select-layout -t $wid tiled
+    fi
+    lastpane=$pane; npane+=1
+    [[ $wa == 1 ]] && sess_active_win+="=${SNAME[$sess]}:$wi"
+    [[ $pa == 1 ]] && win_active_pane[-1]=$pane
+    [[ $wauto == (1|on) ]] && t set -w -t $wid automatic-rename on
+    t set -p -t $pane @revive_id $rid
+    launch+="$pane$US$wa$US$kind$US$sid$US$kc$US$kf$US$cmd$US$nfile$US$sess:$wi"
+  done
+
+  local i
+  for (( i=1; i<=$#win_ids; i++ )); do
+    t select-layout -t $win_ids[i] "$win_layouts[i]" 2>/dev/null || log "layout mismatch in $win_ids[i]"
+    t select-pane -t $win_active_pane[i]
+    [[ $win_zoom[i] == 1 ]] && t resize-pane -Z -t $win_active_pane[i]
+  done
+  for a in $sess_active_win; do t select-window -t $a; done
+  t kill-session -t =__tx_boot 2>/dev/null
+
+  # wait (≤8s) until each shell has drawn its prompt, so typed keys land in zle
+  local waiting=(${launch%%$US*}) deadline=$(( EPOCHREALTIME + 8 )) p
+  while (( $#waiting && EPOCHREALTIME < deadline )); do
+    for p in $waiting; do
+      [[ -n ${"$(t capture-pane -p -t $p 2>/dev/null)"//[[:space:]]/} ]] && waiting=(${waiting:#$p})
+    done
+    (( $#waiting )) && sleep 0.2
+  done
+  sleep 0.3
+
+  # active-window panes first, so what you look at comes back first
+  local ordered=(${(M)launch:#*$US'1'$US*} ${launch:#*$US'1'$US*})
+  for line in $ordered; do
+    local f=("${(@ps:$US:)line}")
+    local pane=$f[1] kind=$f[3] sid=$f[4] kc=$f[5] kf=$f[6] cmd=$f[7] nfile=$f[8] where=$f[9]
+    case $kind in
+      claude)
+        if [[ -z ${${:-$HOME/.claude/projects/*/$sid.jsonl(N)}[1]:-} ]]; then
+          typeline $pane "echo ${(qq):-[tx] Claude session $sid not found (transcript missing)}" 1
+          typeline $pane "claude" 0; fails+="$where: claude $sid transcript missing"
+        elif session_live_elsewhere $sid; then
+          typeline $pane "echo ${(qq):-[tx] Claude session $sid is already open in another pane}" 1
+          fails+="$where: claude $sid already running elsewhere"
+        else
+          [[ -d $kc ]] || kc=$HOME
+          typeline $pane "cd ${(qq)kc} && claude ${kf:+$kf }--resume $sid" 1
+          nclaude+=1; sleep 0.3
+        fi;;
+      nvim)
+        if [[ -n $nfile && -f $nfile ]]; then typeline $pane "nvim -S ${(qq)nfile}" 1; nnvim+=1
+        else typeline $pane "${cmd:-nvim}" 1; nnvim+=1; fi;;
+      vim)   typeline $pane "${cmd/#*vim/vim}" 1;;
+      other)
+        if [[ $cmd == ${~DENY} || $cmd == ${~DENY}\ * ]]; then
+          typeline $pane "echo ${(qq):-[tx] was running: $cmd (not re-run)}" 1
+        else
+          typeline $pane "$cmd" 0                     # pre-typed, press Enter to run
+        fi;;
+    esac
+  done
+
+  rm -f $S/demote/*(N) $S/pending
+  t set -g @tx_active 1 \; set -gu @tx_paused \; set -gu @tx_frozen \; set -gu @tx_restoring
+  local msg="tx: restored $nsess session(s), $nwin windows, $npane panes ($nclaude claude, $nnvim nvim)"
+  (( $#fails )) && msg+=" · ${#fails} issue(s): ${(j:; :)fails}"
+  log $msg; print -r -- $msg
+  t display-message -d 6000 "$msg" 2>/dev/null
+
+  if (( attach )); then
+    [[ -n ${TMUX:-} ]] && { t switch-client -t "=$best_s"; return }
+    exec command tmux ${TX_L:+-L $TX_L} attach -t "=$best_s"
+  fi
+}
+
+# ───────────────────────────── quit ─────────────────────────────
+
+cmd_down() {
+  [[ -n $(spid) ]] || die "tmux is not running"
+  cmd_save --full --now
+  local issues=() socks=() line
+  for line in ${(f)"$(t list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_pid} #{@nvim_sock}')"}; do
+    local where=${line%% *} rest=${line#* } s=${line##* }
+    [[ -n $s && -S $s ]] || continue
+    local n=$(alarm 2 nvim --server $s --remote-expr 'len(getbufinfo({"bufmodified":1}))' 2>/dev/null)
+    if [[ -z $n ]]; then issues+="$where  nvim not responding (unsaved changes unknown)"
+    elif (( n > 0 )); then issues+="$where  nvim has $n unsaved buffer(s)"; socks+=$s; fi
+  done
+  local f
+  for f in $HOME/.claude/sessions/*.json(N); do
+    kill -0 ${${f:t}%.json} 2>/dev/null || continue
+    [[ $(jq -r '.status // empty' $f) == busy ]] || continue
+    local tm=$(jq -r '.tmux // empty' $f)
+    [[ -n $tm ]] && issues+="${tm%%.*}  claude is mid-response (it will resume, but the reply in progress is lost)"
+  done
+  if (( $#issues )); then
+    print "Before quitting:"; print -l "  • "$^issues; print
+    local c; read -k1 "c?[w] write all nvim buffers & quit   [q] quit anyway   [c] cancel  " </dev/tty; print
+    case $c in
+      w) for f in $socks; do alarm 3 nvim --server $f --remote-expr 'execute("silent! wall")' >/dev/null 2>&1; done
+         cmd_save --full --now;;
+      q) ;;
+      *) print "cancelled"; return 1;;
+    esac
+  fi
+  t set -g @tx_frozen 1
+  print "tx: workspace saved — run 'tx' to bring it back."
+  sleep 0.5
+  t kill-server
+}
+
+# ───────────────────────────── internals ─────────────────────────────
+
+cmd_loop() {
+  local i server
+  for i in {1..50}; do server=$(spid); [[ -n $server ]] && break; sleep 0.2; done
+  [[ -n $server ]] || exit 0
+  local lp=$(opt @tx_loop_pid)
+  [[ -n $lp && $lp != $$ ]] && kill -0 $lp 2>/dev/null && exit 0
+  t set -g @tx_loop_pid $$ \; set -g @tx_state $S
+  log "loop start (server $server)"
+  local fails=0
+  sleep 3
+  while [[ $(spid) == $server ]]; do
+    if cmd_save; then fails=0; t set -gu @tx_stale 2>/dev/null
+    else (( ++fails >= 3 )) && t set -g @tx_stale 1 2>/dev/null; fi
+    sleep $INTERVAL
+  done
+  log "loop end"
+}
+
+cmd_confirm() {
+  local want=$(<$S/pending 2>/dev/null); rm -f $S/pending
+  [[ -n $want && $(spid) == $want ]] || { log "hold: server gone, discarded pane-removal snapshot"; return 0 }
+  cmd_save --confirmed
+}
+
+cmd_nudge() {
+  [[ $(opt @tx_active) == 1 || $(opt @tx_restoring) == 1 || ! -f $CUR ]] && return 0
+  t set -g @tx_paused 1
+  t display-message -d 8000 "tx: a saved workspace exists and saving is paused — run 'tx restore' to bring it back (or 'tx reset')"
+}
+
+cmd_claude_hook() {
+  local json=$(cat)
+  [[ -n ${TMUX_PANE:-} && -n ${TMUX:-} ]] || return 0
+  local sid=$(jq -r '.session_id // empty' <<<$json) cwd=$(jq -r '.cwd // empty' <<<$json)
+  [[ -n $sid ]] || return 0
+  local p=$$ i c=
+  for i in {1..8}; do
+    p=$(ps -o ppid= -p $p 2>/dev/null | tr -d ' '); [[ -z $p || $p == 1 ]] && return 0
+    if [[ -e $HOME/.claude/sessions/$p.json || $(ps -o comm= -p $p) == (*/|)claude ]]; then c=$p; break; fi
+  done
+  [[ -n $c ]] || return 0
+  local pg tp ctty
+  read -r pg tp ctty <<<"$(ps -o pgid=,tpgid=,tty= -p $c)"
+  [[ $pg == $tp ]] || return 0                                          # not the foreground claude (e.g. claude -p)
+  [[ /dev/$ctty == $(command tmux display -p -t $TMUX_PANE '#{pane_tty}') ]] || return 0
+  command tmux set -p -t $TMUX_PANE @claude_sid $sid \; set -p -t $TMUX_PANE @claude_pid $c \; set -p -t $TMUX_PANE @claude_cwd "$cwd"
+  ( TX_SOCK=${TMUX%%,*} $TX save --debounce ) >/dev/null 2>&1 &!
+  return 0
+}
+
+cmd_main() {
+  if [[ -n $(spid) ]]; then
+    if [[ $(opt @tx_active) != 1 && -f $CUR ]]; then cmd_restore --attach; return; fi
+    [[ -n ${TMUX:-} ]] && { print "tx: already inside tmux (tx status · tx down)"; return 0 }
+    exec command tmux ${TX_L:+-L $TX_L} attach
+  fi
+  if [[ -f $CUR ]]; then cmd_restore --attach
+  else exec command tmux ${TX_L:+-L $TX_L} ${TX_CONF:+-f $TX_CONF} new-session
+  fi
+}
+
+case ${1:-} in
+  '')            cmd_main ;;
+  save)          shift; [[ -t 0 && -t 1 ]] && set -- --now "$@"; cmd_save "$@"; r=$?; [[ -t 1 ]] && print "tx: saved"; exit $r ;;
+  status|-n)     cmd_status ;;
+  restore)       shift; cmd_restore "$@" ;;
+  down)          cmd_down ;;
+  ignore)        [[ -n ${TMUX_PANE:-} ]] || die "run inside a tmux pane"
+                 if [[ $(t show -pqv -t $TMUX_PANE @tx_ignore) == 1 ]]; then t set -pu -t $TMUX_PANE @tx_ignore; print "tx: this pane will be restored again"
+                 else t set -p -t $TMUX_PANE @tx_ignore 1; print "tx: this pane will be restored as a plain shell"; fi ;;
+  reset)         [[ -f $CUR ]] && mv $CUR $S/history/archived-$(strftime '%Y%m%dT%H%M%S' $EPOCHSECONDS).json
+                 rm -f $S/current.hash; [[ -n $(spid) ]] && t set -gu @tx_paused \; set -g @tx_active 1
+                 print "tx: saved workspace archived (tx restore --pick can still bring it back)" ;;
+  _loop)         cmd_loop ;;
+  _confirm)      cmd_confirm ;;
+  _nudge)        cmd_nudge ;;
+  _claude-hook)  cmd_claude_hook ;;
+  -h|--help|help) sed -n '2,13p' $TX | sed 's/^# \{0,1\}//' ;;
+  *)             die "unknown command '$1' (tx help)" ;;
+esac
